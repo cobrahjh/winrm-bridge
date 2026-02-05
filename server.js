@@ -15,6 +15,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Active sessions - fully concurrent
 const sessions = new Map();
 
+// Running commands - track for cancellation
+const runningCommands = new Map();
+
+// Default timeout (30 seconds)
+const DEFAULT_TIMEOUT = 30000;
+
 // Create new session
 app.post('/session/create', async (req, res) => {
   const { computer = 'localhost', credentials, label } = req.body;
@@ -59,26 +65,64 @@ app.post('/session/create', async (req, res) => {
 // Send command to session (non-blocking for other sessions)
 app.post('/session/:sessionId/exec', async (req, res) => {
   const { sessionId } = req.params;
-  const { command } = req.body;
+  const { command, timeout = DEFAULT_TIMEOUT } = req.body;
 
   const session = sessions.get(sessionId);
   if (!session) {
     return res.status(404).json({ success: false, error: 'Session not found' });
   }
 
+  // Check if command already running
+  if (runningCommands.has(sessionId)) {
+    return res.status(409).json({ success: false, error: 'Command already running. Cancel it first.' });
+  }
+
+  const commandId = uuidv4();
+  let cancelled = false;
+  let timeoutId = null;
+
+  // Track this command
+  runningCommands.set(sessionId, {
+    commandId,
+    command,
+    startTime: Date.now(),
+    cancel: () => { cancelled = true; }
+  });
+
   try {
     console.log(`⚡ Executing in ${session.label}: ${command}`);
     const startTime = Date.now();
-    const result = await session.ps.invoke(command);
+
+    // Race between command execution and timeout
+    const result = await Promise.race([
+      session.ps.invoke(command),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`Command timed out after ${timeout}ms`));
+        }, timeout);
+      }),
+      new Promise((_, reject) => {
+        const checkCancelled = setInterval(() => {
+          if (cancelled) {
+            clearInterval(checkCancelled);
+            reject(new Error('Command cancelled'));
+          }
+        }, 100);
+        // Store interval for cleanup
+        runningCommands.get(sessionId).cancelInterval = checkCancelled;
+      })
+    ]);
+
+    clearTimeout(timeoutId);
     const executionTime = Date.now() - startTime;
-    
+
     session.lastUsed = Date.now();
     session.commandCount++;
 
     console.log(`✓ Command completed in ${executionTime}ms`);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       output: result.raw,
       sessionId,
       label: session.label,
@@ -86,27 +130,65 @@ app.post('/session/:sessionId/exec', async (req, res) => {
       commandCount: session.commandCount
     });
   } catch (error) {
+    clearTimeout(timeoutId);
     console.log(`✗ Command failed: ${error.message}`);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: error.message,
       sessionId,
-      label: session.label
+      label: session.label,
+      timedOut: error.message.includes('timed out'),
+      cancelled: error.message.includes('cancelled')
     });
+  } finally {
+    // Cleanup
+    const cmd = runningCommands.get(sessionId);
+    if (cmd?.cancelInterval) clearInterval(cmd.cancelInterval);
+    runningCommands.delete(sessionId);
   }
+});
+
+// Cancel running command
+app.post('/session/:sessionId/cancel', async (req, res) => {
+  const { sessionId } = req.params;
+
+  const running = runningCommands.get(sessionId);
+  if (!running) {
+    return res.status(404).json({ success: false, error: 'No command running' });
+  }
+
+  console.log(`⚠ Cancelling command in session ${sessionId}`);
+  running.cancel();
+
+  // Also try to kill the PowerShell process and recreate
+  const session = sessions.get(sessionId);
+  if (session) {
+    try {
+      await session.ps.dispose();
+      session.ps = new PowerShell({
+        executionPolicy: 'Bypass',
+        noProfile: true
+      });
+      console.log(`✓ Recreated PowerShell instance for ${session.label}`);
+    } catch (e) {
+      console.log(`⚠ Failed to recreate PowerShell: ${e.message}`);
+    }
+  }
+
+  res.json({ success: true, message: 'Cancel signal sent', commandId: running.commandId });
 });
 
 // Execute command across multiple sessions concurrently
 app.post('/sessions/exec-all', async (req, res) => {
-  const { command, sessionIds } = req.body;
-  
+  const { command, sessionIds, timeout } = req.body;
+
   const targetSessions = sessionIds || Array.from(sessions.keys());
   console.log(`⚡ Executing across ${targetSessions.length} sessions concurrently...`);
-  
+
   const results = await Promise.all(
     targetSessions.map(async (sessionId) => {
       try {
-        const response = await axios.post(`http://localhost:${PORT}/session/${sessionId}/exec`, { command });
+        const response = await axios.post(`http://localhost:${PORT}/session/${sessionId}/exec`, { command, timeout });
         return { sessionId, ...response.data };
       } catch (error) {
         return { sessionId, success: false, error: error.response?.data?.error || error.message };
@@ -115,6 +197,20 @@ app.post('/sessions/exec-all', async (req, res) => {
   );
 
   res.json({ results, count: results.length });
+});
+
+// Cancel all running commands
+app.post('/sessions/cancel-all', async (req, res) => {
+  const cancelled = [];
+  for (const sessionId of runningCommands.keys()) {
+    try {
+      await axios.post(`http://localhost:${PORT}/session/${sessionId}/cancel`);
+      cancelled.push(sessionId);
+    } catch (error) {
+      console.log(`Failed to cancel ${sessionId}: ${error.message}`);
+    }
+  }
+  res.json({ success: true, cancelled, count: cancelled.length });
 });
 
 // Get session info
@@ -126,6 +222,7 @@ app.get('/session/:sessionId', (req, res) => {
     return res.status(404).json({ success: false, error: 'Session not found' });
   }
 
+  const running = runningCommands.get(sessionId);
   res.json({
     sessionId,
     label: session.label,
@@ -133,7 +230,8 @@ app.get('/session/:sessionId', (req, res) => {
     created: session.created,
     lastUsed: session.lastUsed,
     uptime: Date.now() - session.created,
-    commandCount: session.commandCount
+    commandCount: session.commandCount,
+    running: running ? { command: running.command, elapsed: Date.now() - running.startTime } : null
   });
 });
 
@@ -189,20 +287,25 @@ app.delete('/sessions/all', async (req, res) => {
 
 // List all sessions
 app.get('/sessions', (req, res) => {
-  const sessionList = Array.from(sessions.entries()).map(([id, session]) => ({
-    sessionId: id,
-    label: session.label,
-    computer: session.computer,
-    created: session.created,
-    lastUsed: session.lastUsed,
-    uptime: Date.now() - session.created,
-    commandCount: session.commandCount
-  }));
+  const sessionList = Array.from(sessions.entries()).map(([id, session]) => {
+    const running = runningCommands.get(id);
+    return {
+      sessionId: id,
+      label: session.label,
+      computer: session.computer,
+      created: session.created,
+      lastUsed: session.lastUsed,
+      uptime: Date.now() - session.created,
+      commandCount: session.commandCount,
+      running: running ? { command: running.command, elapsed: Date.now() - running.startTime } : null
+    };
+  });
 
-  res.json({ 
-    sessions: sessionList, 
+  res.json({
+    sessions: sessionList,
     count: sessionList.length,
-    totalCommands: sessionList.reduce((sum, s) => sum + s.commandCount, 0)
+    totalCommands: sessionList.reduce((sum, s) => sum + s.commandCount, 0),
+    runningCount: runningCommands.size
   });
 });
 

@@ -83,6 +83,9 @@
   .btn-action.danger:active{border-color:var(--red);color:var(--red)}
   .btn-action.broadcast{color:var(--accent);border-color:var(--accent-dim)}
   .btn-action.broadcast:active{background:var(--accent);color:#000}
+  .btn-action.stop{background:var(--red);color:#fff;border-color:var(--red);animation:pulse-red 1s infinite}
+  @keyframes pulse-red{0%,100%{opacity:1}50%{opacity:.7}}
+  .session-running{color:var(--accent);font-size:11px;animation:pulse 1s infinite}
 
   /* OUTPUT */
   .terminal-output{flex:1;overflow-y:auto;padding:14px 16px;font-size:13px;line-height:1.65;-webkit-overflow-scrolling:touch;min-height:0}
@@ -203,6 +206,7 @@
       <div class="terminal-title" id="terminalTitle">Select or create a session</div>
       <div class="terminal-actions">
         <button class="btn-action broadcast" onclick="broadcastCmd()">⚡ ALL</button>
+        <button class="btn-action stop" id="btnCancel" onclick="cancelCmd()" style="display:none">⏹ STOP</button>
         <button class="btn-action danger" id="btnClose" onclick="closeSession()" style="display:none">✕</button>
       </div>
     </div>
@@ -272,17 +276,17 @@ function renderSessions(){
   }
   el.innerHTML=sessions.map(s=>`
     <div class="session-card ${activeSession===s.sessionId?'active':''}" onclick="selectSession('${s.sessionId}')">
-      <div class="session-label">${esc(s.label)}</div>
+      <div class="session-label">${esc(s.label)}${s.running?' <span class="session-running">⏳</span>':''}</div>
       <div class="session-meta">
         <span class="computer">${esc(s.computer)}</span>
         <span class="cmds">${s.commandCount} cmds</span>
-        <span>${fmtUp(s.uptime)}</span>
+        <span>${s.running?fmtUp(s.running.elapsed)+' running':fmtUp(s.uptime)}</span>
       </div>
     </div>`).join('');
   tabs.innerHTML=sessions.map(s=>`
     <div class="stab ${activeSession===s.sessionId?'active':''}" onclick="selectSession('${s.sessionId}')">
-      <span class="sdot"></span>
-      ${esc(s.label)}
+      <span class="sdot" style="${s.running?'background:var(--accent);box-shadow:0 0 8px var(--accent)':''}"></span>
+      ${esc(s.label)}${s.running?' ⏳':''}
       <span class="sclose" onclick="event.stopPropagation();closeSessionById('${s.sessionId}')">✕</span>
     </div>`).join('');
 }
@@ -319,11 +323,28 @@ async function execCmd(){
   const idx=hist[activeSession].length;
   hist[activeSession].push({cmd,output:'⏳ executing...',time:'',error:false});
   renderOutput();
+  // Show cancel button, disable input
+  document.getElementById('btnCancel').style.display='';
+  document.getElementById('cmdInput').disabled=true;
+  document.getElementById('btnSend').disabled=true;
   try{
     const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd}});
     hist[activeSession][idx]={cmd,output:d.success?(d.output||'(no output)'):d.error,time:d.executionTime||'?',error:!d.success};
+    if(d.timedOut)hist[activeSession][idx].output='⏱ '+hist[activeSession][idx].output;
+    if(d.cancelled)hist[activeSession][idx].output='⏹ '+hist[activeSession][idx].output;
   }catch(err){hist[activeSession][idx]={cmd,output:err.message,time:'—',error:true}}
+  // Hide cancel button, re-enable input
+  document.getElementById('btnCancel').style.display='none';
+  document.getElementById('cmdInput').disabled=false;
+  document.getElementById('btnSend').disabled=false;
   renderOutput();refreshSessions();
+}
+
+async function cancelCmd(){
+  if(!activeSession)return;
+  try{
+    await api(`/session/${activeSession}/cancel`,{method:'POST'});
+  }catch(err){console.log('Cancel failed:',err)}
 }
 
 async function broadcastCmd(){
@@ -348,6 +369,7 @@ async function closeSessionById(id){
     activeSession=null;
     document.getElementById('terminalTitle').textContent='Select or create a session';
     document.getElementById('btnClose').style.display='none';
+    document.getElementById('btnCancel').style.display='none';
     document.getElementById('cmdInput').disabled=true;
     document.getElementById('btnSend').disabled=true;
     document.getElementById('output').innerHTML='<div class="welcome-msg"><div class="big">Session Closed</div></div>';
