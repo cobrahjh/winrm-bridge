@@ -6,6 +6,10 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0a0a0c">
 <title>WinRM Bridge // Hive</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;600;800&display=swap');
   :root {
@@ -88,7 +92,7 @@
   .session-running{color:var(--accent);font-size:11px;animation:pulse 1s infinite}
 
   /* OUTPUT */
-  .terminal-output{flex:1;overflow-y:auto;padding:14px 16px;font-size:13px;line-height:1.65;-webkit-overflow-scrolling:touch;min-height:0}
+  .terminal-output{flex:1;overflow-y:auto;padding:0;font-size:13px;line-height:1.65;-webkit-overflow-scrolling:touch;min-height:0;position:relative}
   .output-entry{margin-bottom:14px;overflow-wrap:break-word;word-break:break-word}
   .output-cmd{color:var(--accent);font-weight:500}
   .output-cmd::before{content:'❯ ';color:var(--text-dim)}
@@ -96,8 +100,13 @@
   .output-error{color:var(--red)}
   .output-info{color:var(--text-dim);font-style:italic}
   .output-time{color:var(--text-dim);font-size:11px;float:right}
-  .welcome-msg{color:var(--text-dim);padding:40px 16px;text-align:center;font-size:13px;line-height:2}
+  .welcome-msg{color:var(--text-dim);padding:40px 20px;text-align:center;font-size:13px;line-height:2}
   .welcome-msg .big{font-family:var(--sans);font-size:22px;font-weight:600;color:var(--text)}
+  /* xterm.js container */
+  #xterm-container{display:none;width:100%;height:100%}
+  #xterm-container.active{display:block}
+  .xterm{height:100% !important}
+  .xterm-viewport{overflow-y:auto !important}
 
   /* INPUT */
   .terminal-input-area{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface);display:flex;align-items:center;gap:8px;flex-shrink:0}
@@ -130,7 +139,7 @@
     .main{display:flex;flex:1;overflow:hidden;min-height:0}
     .header{padding:12px 20px}
     .terminal-header{padding:10px 20px}
-    .terminal-output{padding:16px 20px}
+    .terminal-output{padding:0}
     .terminal-input-area{padding:12px 20px}
     .terminal-input{background:transparent;border:none;padding:0;border-radius:0}
     .terminal-input:focus{border-color:transparent}
@@ -216,7 +225,8 @@
       </div>
     </div>
     <div class="terminal-output" id="output">
-      <div class="welcome-msg">
+      <div id="xterm-container"></div>
+      <div id="welcome-msg" class="welcome-msg">
         <div class="big">WinRM Bridge</div>
         <div style="margin:16px 0;text-align:left;max-width:400px;display:inline-block">
           <div style="color:var(--accent);font-weight:600;margin-bottom:8px">Quick Start</div>
@@ -240,7 +250,7 @@
         </div>
       </div>
     </div>
-    <div class="terminal-input-area">
+    <div class="terminal-input-area" id="inputArea">
       <span class="prompt">❯</span>
       <input class="terminal-input" id="cmdInput" placeholder="PowerShell command..." disabled
              onkeydown="if(event.key==='Enter'){event.preventDefault();execCmd()}"
@@ -278,6 +288,75 @@ const API='';
 const WS_BASE = `${location.protocol==='https:'?'wss:':'ws:'}//${location.host}`;
 let sessions=[],activeSession=null,hist={},cmdHistory=[],cmdHistoryIdx=-1;
 let ws=null; // WebSocket connection
+let term=null,fitAddon=null; // xterm.js terminal
+let isLocalSession=false;
+
+// Initialize xterm.js terminal
+function initXterm(){
+  if(term){term.dispose()}
+  term=new Terminal({
+    cursorBlink:true,
+    fontSize:13,
+    fontFamily:'JetBrains Mono, Consolas, monospace',
+    lineHeight:1.2,
+    theme:{
+      background:'#0a0a0c',
+      foreground:'#c8c8d0',
+      cursor:'#f59e0b',
+      cursorAccent:'#0a0a0c',
+      selectionBackground:'rgba(245,158,11,0.3)',
+      black:'#0a0a0c',
+      red:'#ef4444',
+      green:'#22c55e',
+      yellow:'#f59e0b',
+      blue:'#3b82f6',
+      magenta:'#a855f7',
+      cyan:'#06b6d4',
+      white:'#c8c8d0',
+      brightBlack:'#66666e',
+      brightRed:'#f87171',
+      brightGreen:'#4ade80',
+      brightYellow:'#fbbf24',
+      brightBlue:'#60a5fa',
+      brightMagenta:'#c084fc',
+      brightCyan:'#22d3ee',
+      brightWhite:'#f8f8f8'
+    }
+  });
+  fitAddon=new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open(document.getElementById('xterm-container'));
+  fitAddon.fit();
+
+  // Handle keyboard input from xterm (for local sessions)
+  term.onData((data)=>{
+    if(ws&&ws.readyState===WebSocket.OPEN&&isLocalSession){
+      ws.send(JSON.stringify({type:'input',data}));
+    }
+  });
+}
+
+// Handle window resize for xterm
+window.addEventListener('resize',()=>{
+  if(fitAddon&&term){
+    fitAddon.fit();
+    if(ws&&ws.readyState===WebSocket.OPEN&&isLocalSession){
+      ws.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}));
+    }
+  }
+});
+
+function showXterm(){
+  document.getElementById('xterm-container').classList.add('active');
+  document.getElementById('welcome-msg').style.display='none';
+  if(fitAddon)setTimeout(()=>fitAddon.fit(),10);
+}
+
+function hideXterm(){
+  document.getElementById('xterm-container').classList.remove('active');
+  document.getElementById('welcome-msg').style.display='';
+}
 
 function toggleDrawer(){
   document.getElementById('sidebar').classList.toggle('open');
@@ -331,40 +410,75 @@ function selectSession(id){
 
   activeSession=id;
   const s=sessions.find(x=>x.sessionId===id);
-  document.getElementById('terminalTitle').innerHTML=`<span class="name">${esc(s.label)}</span> — ${esc(s.computer)}`;
+  isLocalSession = s.type === 'local';
+  const typeIcon = isLocalSession ? '⌨' : '🌐';
+  document.getElementById('terminalTitle').innerHTML=`${typeIcon} <span class="name">${esc(s.label)}</span> — ${isLocalSession ? (s.shell||'shell') : esc(s.computer)}`;
   document.getElementById('btnClose').style.display='';
-  document.getElementById('cmdInput').disabled=false;
-  document.getElementById('btnSend').disabled=false;
+  // Show STOP button for local terminals (always available for Ctrl+C)
+  document.getElementById('btnCancel').style.display = isLocalSession ? '' : 'none';
   closeDrawer();
-  renderOutput();renderSessions();
+
+  // Initialize xterm if needed
+  if(!term)initXterm();
+  term.clear();
+  term.reset();
+  showXterm();
+
+  // For local sessions: hide command input (xterm handles input)
+  // For WinRM sessions: show command input
+  const inputArea=document.getElementById('inputArea');
+  if(isLocalSession){
+    inputArea.style.display='none';
+  }else{
+    inputArea.style.display='';
+    document.getElementById('cmdInput').disabled=false;
+    document.getElementById('btnSend').disabled=false;
+  }
 
   // Connect WebSocket for streaming
   connectWebSocket(id);
 
-  // Don't auto-focus on mobile (prevents keyboard popup)
-  if(window.innerWidth>768) document.getElementById('cmdInput').focus();
+  // Focus xterm for local sessions, input for WinRM
+  if(window.innerWidth>768){
+    if(isLocalSession){
+      term.focus();
+    }else{
+      document.getElementById('cmdInput').focus();
+    }
+  }
 }
 
 function connectWebSocket(sessionId){
   ws=new WebSocket(`${WS_BASE}?session=${sessionId}`);
-  ws.onopen=()=>{console.log('WebSocket connected')};
+  ws.onopen=()=>{
+    console.log('WebSocket connected');
+    // Send initial terminal size for local sessions
+    if(isLocalSession&&term){
+      ws.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}));
+    }
+  };
   ws.onmessage=(e)=>{
     try{
       const msg=JSON.parse(e.data);
       if(msg.type==='output'){
         appendStreamOutput(msg.data);
       }else if(msg.type==='result'){
-        document.getElementById('btnCancel').style.display='none';
-        document.getElementById('cmdInput').disabled=false;
-        document.getElementById('btnSend').disabled=false;
+        // For WinRM sessions, re-enable input
+        if(!isLocalSession){
+          document.getElementById('btnCancel').style.display='none';
+          document.getElementById('cmdInput').disabled=false;
+          document.getElementById('btnSend').disabled=false;
+        }
         refreshSessions();
       }else if(msg.type==='interrupted'){
-        appendStreamOutput('[Interrupted]\n');
-        document.getElementById('btnCancel').style.display='none';
-        document.getElementById('cmdInput').disabled=false;
-        document.getElementById('btnSend').disabled=false;
+        if(term)term.writeln('\x1b[33m[Interrupted]\x1b[0m');
+        if(!isLocalSession){
+          document.getElementById('btnCancel').style.display='none';
+          document.getElementById('cmdInput').disabled=false;
+          document.getElementById('btnSend').disabled=false;
+        }
       }else if(msg.type==='error'){
-        appendStreamOutput(`[Error: ${msg.message}]\n`);
+        if(term)term.writeln('\x1b[31m[Error: '+msg.message+']\x1b[0m');
       }
     }catch(err){console.error('WS parse error:',err)}
   };
@@ -373,29 +487,9 @@ function connectWebSocket(sessionId){
 }
 
 function appendStreamOutput(text){
-  const el=document.getElementById('output');
-  // Create or get streaming div
-  let streamDiv=document.getElementById('streamOutput');
-  if(!streamDiv){
-    el.innerHTML='';
-    streamDiv=document.createElement('pre');
-    streamDiv.id='streamOutput';
-    streamDiv.style.cssText='white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px;color:var(--text)';
-    el.appendChild(streamDiv);
+  if(term){
+    term.write(text);
   }
-  streamDiv.textContent+=text;
-  el.scrollTop=el.scrollHeight;
-}
-
-function renderOutput(){
-  const el=document.getElementById('output'),entries=hist[activeSession]||[];
-  if(!entries.length){el.innerHTML='<div class="output-info">Session ready. Type a command.</div>'}
-  else{el.innerHTML=entries.map(e=>`
-    <div class="output-entry">
-      <div class="output-cmd">${esc(e.cmd)} <span class="output-time">${e.time}ms</span></div>
-      <div class="output-result ${e.error?'output-error':''}">${esc(e.output)}</div>
-    </div>`).join('')}
-  el.scrollTop=el.scrollHeight;
 }
 
 async function execCmd(){
@@ -407,30 +501,37 @@ async function execCmd(){
   const timeoutVal = parseInt(document.getElementById('timeoutSelect').value) || 600000;
   const timeout = timeoutVal === 0 ? 600000 : timeoutVal; // 0 means 10 min max
 
-  // Show cancel button, disable input
-  document.getElementById('btnCancel').style.display='';
-  document.getElementById('cmdInput').disabled=true;
-  document.getElementById('btnSend').disabled=true;
+  // Show command in xterm for WinRM sessions
+  if(term){
+    term.writeln('\x1b[33m❯ '+cmd+'\x1b[0m');
+  }
 
-  // Use WebSocket if connected, otherwise fall back to REST
+  // Use WebSocket if connected
   if(ws && ws.readyState===WebSocket.OPEN){
+    // For WinRM, use exec with timeout
+    document.getElementById('btnCancel').style.display='';
+    document.getElementById('cmdInput').disabled=true;
+    document.getElementById('btnSend').disabled=true;
     ws.send(JSON.stringify({type:'exec',command:cmd,timeout}));
   }else{
-    // Fallback to REST API
-    if(!hist[activeSession])hist[activeSession]=[];
-    const idx=hist[activeSession].length;
-    hist[activeSession].push({cmd,output:'⏳ executing...',time:'',error:false});
-    renderOutput();
+    // Fallback to REST API (WinRM only)
+    document.getElementById('btnCancel').style.display='';
+    document.getElementById('cmdInput').disabled=true;
+    document.getElementById('btnSend').disabled=true;
     try{
       const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd,timeout}});
-      hist[activeSession][idx]={cmd,output:d.success?(d.output||'(no output)'):d.error,time:d.executionTime||'?',error:!d.success};
-      if(d.timedOut)hist[activeSession][idx].output='⏱ '+hist[activeSession][idx].output;
-      if(d.cancelled)hist[activeSession][idx].output='⏹ '+hist[activeSession][idx].output;
-    }catch(err){hist[activeSession][idx]={cmd,output:err.message,time:'—',error:true}}
+      if(term){
+        const output=d.success?(d.output||'(no output)'):('\x1b[31m'+d.error+'\x1b[0m');
+        term.write(output);
+        if(!output.endsWith('\n'))term.writeln('');
+      }
+    }catch(err){
+      if(term)term.writeln('\x1b[31mError: '+err.message+'\x1b[0m');
+    }
     document.getElementById('btnCancel').style.display='none';
     document.getElementById('cmdInput').disabled=false;
     document.getElementById('btnSend').disabled=false;
-    renderOutput();refreshSessions();
+    refreshSessions();
   }
 }
 
@@ -450,11 +551,24 @@ async function cancelCmd(){
 async function broadcastCmd(){
   const cmd=prompt('Broadcast to ALL sessions:');
   if(!cmd||!sessions.length)return;
-  for(const s of sessions){if(!hist[s.sessionId])hist[s.sessionId]=[];hist[s.sessionId].push({cmd:`[ALL] ${cmd}`,output:'⏳...',time:'',error:false})}
-  renderOutput();
+  if(term){
+    term.writeln('\x1b[35m[BROADCAST] '+cmd+'\x1b[0m');
+  }
   const d=await api('/sessions/exec-all',{method:'POST',body:{command:cmd}});
-  for(const r of(d.results||[])){const h=hist[r.sessionId];if(h)h[h.length-1]={cmd:`[ALL] ${cmd}`,output:r.success?(r.output||'(no output)'):r.error,time:r.executionTime||'?',error:!r.success}}
-  renderOutput();refreshSessions();
+  if(term){
+    for(const r of(d.results||[])){
+      const s=sessions.find(x=>x.sessionId===r.sessionId);
+      const label=s?s.label:r.sessionId;
+      if(r.success){
+        term.writeln('\x1b[36m['+label+']\x1b[0m');
+        term.write(r.output||'(no output)');
+        if(!(r.output||'').endsWith('\n'))term.writeln('');
+      }else{
+        term.writeln('\x1b[31m['+label+'] Error: '+r.error+'\x1b[0m');
+      }
+    }
+  }
+  refreshSessions();
 }
 
 async function closeSession(){
@@ -467,12 +581,15 @@ async function closeSessionById(id){
   delete hist[id];
   if(activeSession===id){
     activeSession=null;
+    isLocalSession=false;
+    if(ws){ws.close();ws=null;}
     document.getElementById('terminalTitle').textContent='Select or create a session';
     document.getElementById('btnClose').style.display='none';
     document.getElementById('btnCancel').style.display='none';
+    document.getElementById('inputArea').style.display='';
     document.getElementById('cmdInput').disabled=true;
     document.getElementById('btnSend').disabled=true;
-    document.getElementById('output').innerHTML='<div class="welcome-msg"><div class="big">Session Closed</div></div>';
+    hideXterm();
   }
   await refreshSessions();
   // Auto-select another session if available
@@ -534,35 +651,34 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 function fmtUp(ms){const s=Math.floor(ms/1000);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h'}
 
 function showHelp(){
-  const help=`
-<div style="text-align:left;line-height:1.8">
-<h3 style="color:var(--accent);margin:0 0 12px">WinRM Bridge Help</h3>
+  // Hide xterm and show welcome message area with help content
+  hideXterm();
+  const welcomeEl=document.getElementById('welcome-msg');
+  welcomeEl.innerHTML=`
+<div style="text-align:left;line-height:1.8;display:inline-block;max-width:450px">
+<h3 style="color:var(--accent);margin:0 0 12px;font-family:var(--sans)">WinRM Bridge Help</h3>
 
 <b style="color:var(--accent)">Keyboard Shortcuts</b>
 <div style="margin:4px 0 12px;font-size:12px">
   <b>Enter</b> - Execute command<br>
   <b>↑ / ↓</b> - Navigate command history<br>
-  <b>Ctrl+C</b> - In terminal, same as STOP
+  <b>Ctrl+C</b> - Send interrupt to terminal
 </div>
 
 <b style="color:var(--accent)">Buttons</b>
 <div style="margin:4px 0 12px;font-size:12px">
   <b>⚡ Local</b> - Quick connect to localhost<br>
   <b>⏹ STOP</b> - Cancel running command (Ctrl+C)<br>
-  <b>⚡ ALL</b> - Run command on all sessions<br>
+  <b>⚡ ALL</b> - Broadcast to all sessions<br>
   <b>+ NEW</b> - Create session (local or remote)
 </div>
 
-<b style="color:var(--accent)">Timeout</b>
+<b style="color:var(--accent)">Session Types</b>
 <div style="margin:4px 0 12px;font-size:12px">
-  Commands auto-cancel after 30 seconds.<br>
-  Use STOP button to cancel earlier.
-</div>
-
-<b style="color:var(--accent)">Remote Sessions</b>
-<div style="margin:4px 0 12px;font-size:12px">
-  Click + NEW, enter hostname/IP and<br>
-  credentials to connect via WinRM.
+  <b>Local (⌨)</b> - Full interactive PTY terminal<br>
+  Supports colors, cursor movement, interactive CLIs<br><br>
+  <b>Remote (🌐)</b> - WinRM command execution<br>
+  Enter commands in input box below terminal
 </div>
 
 <b style="color:var(--accent)">API</b>
@@ -571,7 +687,7 @@ function showHelp(){
   WebSocket: <code>ws://localhost:8775?session=ID</code>
 </div>
 </div>`;
-  document.getElementById('output').innerHTML='<div class="welcome-msg" style="padding:20px">'+help+'</div>';
+  welcomeEl.style.display='';
 }
 
 refreshSessions();setInterval(refreshSessions,10000);
