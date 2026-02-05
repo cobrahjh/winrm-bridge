@@ -1,39 +1,112 @@
-# WinRM Bridge - Concurrent Session PowerShell Service
+# WinRM Bridge
 
-Web-based REST API for persistent PowerShell/WinRM sessions with full concurrency support.
+Concurrent PowerShell session manager with real-time WebSocket streaming.
 
-## Installation
+## Features
 
-```batch
-cd C:\DevClaude\Hivemind\services\winrm-bridge
-INSTALL-IMMORTAL.bat
-```
+- **Multiple concurrent sessions** - Local or remote WinRM connections
+- **WebSocket streaming** - Real-time command output
+- **Timeout protection** - Commands auto-cancel after 30s (configurable)
+- **Cancel/Interrupt** - Stop stuck commands instantly
+- **Web UI** - Mobile-friendly interface
+- **Hive mesh integration** - Auto-registers with orchestrator
 
-Service runs on port **8775** and auto-starts with Windows.
+## Quick Start
 
-## API Endpoints
-
-### Create Session
 ```bash
-POST /session/create
-{
-  "computer": "localhost",           # or "192.168.1.97"
-  "label": "My-Session",            # optional friendly name
-  "credentials": {                   # optional for remote
-    "username": "DOMAIN\\user",
-    "password": "password"
-  }
-}
+npm install
+node server.js
 ```
 
-### Execute Command
-```bash
-POST /session/:sessionId/exec
-{"command": "Get-Process | Select-Object -First 5"}
+Open http://localhost:8775
+
+## API Reference
+
+### Sessions
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/session/create` | Create new session |
+| `GET` | `/sessions` | List all sessions |
+| `GET` | `/session/:id` | Get session info |
+| `PATCH` | `/session/:id` | Update session label |
+| `DELETE` | `/session/:id` | Close session |
+| `DELETE` | `/sessions/all` | Close all sessions |
+
+### Command Execution
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/session/:id/exec` | Execute command (with timeout) |
+| `POST` | `/session/:id/cancel` | Cancel running command |
+| `POST` | `/sessions/exec-all` | Broadcast to all sessions |
+| `POST` | `/sessions/cancel-all` | Cancel all running commands |
+
+### WebSocket
+
+Connect: `ws://localhost:8775?session=<sessionId>`
+
+**Send:**
+```json
+{"type": "exec", "command": "Get-Date", "timeout": 30000}
+{"type": "interrupt"}
 ```
 
-### Execute Across All Sessions
-```bash
-POST /sessions/exec-all
-{"command": "hostname"}
+**Receive:**
+```json
+{"type": "output", "data": "..."}
+{"type": "result", "success": true, "output": "...", "executionTime": 150}
+{"type": "error", "message": "..."}
+{"type": "interrupted"}
 ```
+
+## Examples
+
+### Create Local Session
+```bash
+curl -X POST http://localhost:8775/session/create \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Local PS"}'
+```
+
+### Create Remote Session
+```bash
+curl -X POST http://localhost:8775/session/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "computer": "192.168.1.42",
+    "label": "Remote-PC",
+    "credentials": {
+      "username": "DOMAIN\\user",
+      "password": "password"
+    }
+  }'
+```
+
+### Execute with Timeout
+```bash
+curl -X POST http://localhost:8775/session/<id>/exec \
+  -H "Content-Type: application/json" \
+  -d '{"command": "Get-Process", "timeout": 5000}'
+```
+
+### Cancel Running Command
+```bash
+curl -X POST http://localhost:8775/session/<id>/cancel
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | 8775 | HTTP/WebSocket port |
+| `DEFAULT_TIMEOUT` | 30000 | Command timeout (ms) |
+| `HIVE_MESH` | localhost:8750 | Orchestrator address |
+
+## Installation as Service
+
+Run `INSTALL-IMMORTAL.bat` to install as Windows service (auto-starts with Windows).
+
+## Port
+
+**8775** - HTTP API + WebSocket

@@ -161,6 +161,7 @@
   <div class="header-right">
     <span class="port-label">:8775</span>
     <span class="session-count" id="sessionCount">0</span> sessions
+    <button class="btn-menu" onclick="showHelp()" title="Help" style="margin-left:8px">?</button>
   </div>
 </div>
 
@@ -213,8 +214,26 @@
     <div class="terminal-output" id="output">
       <div class="welcome-msg">
         <div class="big">WinRM Bridge</div>
-        PowerShell sessions across your Hive<br>
-        Tap a machine above to connect
+        <div style="margin:16px 0;text-align:left;max-width:400px;display:inline-block">
+          <div style="color:var(--accent);font-weight:600;margin-bottom:8px">Quick Start</div>
+          <div style="line-height:1.8;font-size:12px">
+            1. Tap <b>⚡ Local</b> or a machine above<br>
+            2. Type PowerShell commands<br>
+            3. Press Enter or tap <b>▶</b> to execute
+          </div>
+          <div style="color:var(--accent);font-weight:600;margin:12px 0 8px">Features</div>
+          <div style="line-height:1.8;font-size:12px">
+            <b>⏹ STOP</b> - Cancel stuck commands<br>
+            <b>⚡ ALL</b> - Broadcast to all sessions<br>
+            <b>30s timeout</b> - Auto-cancels long commands<br>
+            <b>↑↓ arrows</b> - Command history
+          </div>
+          <div style="color:var(--accent);font-weight:600;margin:12px 0 8px">Remote Sessions</div>
+          <div style="line-height:1.8;font-size:12px">
+            Tap <b>+ New</b> to connect to remote<br>
+            machines via WinRM with credentials
+          </div>
+        </div>
       </div>
     </div>
     <div class="terminal-input-area">
@@ -244,7 +263,9 @@
 
 <script>
 const API='';
+const WS_BASE = `${location.protocol==='https:'?'wss:':'ws:'}//${location.host}`;
 let sessions=[],activeSession=null,hist={},cmdHistory=[],cmdHistoryIdx=-1;
+let ws=null; // WebSocket connection
 
 function toggleDrawer(){
   document.getElementById('sidebar').classList.toggle('open');
@@ -292,6 +313,9 @@ function renderSessions(){
 }
 
 function selectSession(id){
+  // Close existing WebSocket
+  if(ws){ws.close();ws=null;}
+
   activeSession=id;
   const s=sessions.find(x=>x.sessionId===id);
   document.getElementById('terminalTitle').innerHTML=`<span class="name">${esc(s.label)}</span> — ${esc(s.computer)}`;
@@ -300,8 +324,54 @@ function selectSession(id){
   document.getElementById('btnSend').disabled=false;
   closeDrawer();
   renderOutput();renderSessions();
+
+  // Connect WebSocket for streaming
+  connectWebSocket(id);
+
   // Don't auto-focus on mobile (prevents keyboard popup)
   if(window.innerWidth>768) document.getElementById('cmdInput').focus();
+}
+
+function connectWebSocket(sessionId){
+  ws=new WebSocket(`${WS_BASE}?session=${sessionId}`);
+  ws.onopen=()=>{console.log('WebSocket connected')};
+  ws.onmessage=(e)=>{
+    try{
+      const msg=JSON.parse(e.data);
+      if(msg.type==='output'){
+        appendStreamOutput(msg.data);
+      }else if(msg.type==='result'){
+        document.getElementById('btnCancel').style.display='none';
+        document.getElementById('cmdInput').disabled=false;
+        document.getElementById('btnSend').disabled=false;
+        refreshSessions();
+      }else if(msg.type==='interrupted'){
+        appendStreamOutput('[Interrupted]\n');
+        document.getElementById('btnCancel').style.display='none';
+        document.getElementById('cmdInput').disabled=false;
+        document.getElementById('btnSend').disabled=false;
+      }else if(msg.type==='error'){
+        appendStreamOutput(`[Error: ${msg.message}]\n`);
+      }
+    }catch(err){console.error('WS parse error:',err)}
+  };
+  ws.onclose=()=>{console.log('WebSocket disconnected')};
+  ws.onerror=(e)=>{console.error('WebSocket error:',e)};
+}
+
+function appendStreamOutput(text){
+  const el=document.getElementById('output');
+  // Create or get streaming div
+  let streamDiv=document.getElementById('streamOutput');
+  if(!streamDiv){
+    el.innerHTML='';
+    streamDiv=document.createElement('pre');
+    streamDiv.id='streamOutput';
+    streamDiv.style.cssText='white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px;color:var(--text)';
+    el.appendChild(streamDiv);
+  }
+  streamDiv.textContent+=text;
+  el.scrollTop=el.scrollHeight;
 }
 
 function renderOutput(){
@@ -319,32 +389,45 @@ async function execCmd(){
   const input=document.getElementById('cmdInput'),cmd=input.value.trim();
   if(!cmd||!activeSession)return;
   input.value='';cmdHistory.unshift(cmd);cmdHistoryIdx=-1;
-  if(!hist[activeSession])hist[activeSession]=[];
-  const idx=hist[activeSession].length;
-  hist[activeSession].push({cmd,output:'⏳ executing...',time:'',error:false});
-  renderOutput();
+
   // Show cancel button, disable input
   document.getElementById('btnCancel').style.display='';
   document.getElementById('cmdInput').disabled=true;
   document.getElementById('btnSend').disabled=true;
-  try{
-    const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd}});
-    hist[activeSession][idx]={cmd,output:d.success?(d.output||'(no output)'):d.error,time:d.executionTime||'?',error:!d.success};
-    if(d.timedOut)hist[activeSession][idx].output='⏱ '+hist[activeSession][idx].output;
-    if(d.cancelled)hist[activeSession][idx].output='⏹ '+hist[activeSession][idx].output;
-  }catch(err){hist[activeSession][idx]={cmd,output:err.message,time:'—',error:true}}
-  // Hide cancel button, re-enable input
-  document.getElementById('btnCancel').style.display='none';
-  document.getElementById('cmdInput').disabled=false;
-  document.getElementById('btnSend').disabled=false;
-  renderOutput();refreshSessions();
+
+  // Use WebSocket if connected, otherwise fall back to REST
+  if(ws && ws.readyState===WebSocket.OPEN){
+    ws.send(JSON.stringify({type:'exec',command:cmd,timeout:30000}));
+  }else{
+    // Fallback to REST API
+    if(!hist[activeSession])hist[activeSession]=[];
+    const idx=hist[activeSession].length;
+    hist[activeSession].push({cmd,output:'⏳ executing...',time:'',error:false});
+    renderOutput();
+    try{
+      const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd}});
+      hist[activeSession][idx]={cmd,output:d.success?(d.output||'(no output)'):d.error,time:d.executionTime||'?',error:!d.success};
+      if(d.timedOut)hist[activeSession][idx].output='⏱ '+hist[activeSession][idx].output;
+      if(d.cancelled)hist[activeSession][idx].output='⏹ '+hist[activeSession][idx].output;
+    }catch(err){hist[activeSession][idx]={cmd,output:err.message,time:'—',error:true}}
+    document.getElementById('btnCancel').style.display='none';
+    document.getElementById('cmdInput').disabled=false;
+    document.getElementById('btnSend').disabled=false;
+    renderOutput();refreshSessions();
+  }
 }
 
 async function cancelCmd(){
   if(!activeSession)return;
-  try{
-    await api(`/session/${activeSession}/cancel`,{method:'POST'});
-  }catch(err){console.log('Cancel failed:',err)}
+  // Use WebSocket if connected
+  if(ws && ws.readyState===WebSocket.OPEN){
+    ws.send(JSON.stringify({type:'interrupt'}));
+  }else{
+    try{
+      await api(`/session/${activeSession}/cancel`,{method:'POST'});
+    }catch(err){console.log('Cancel failed:',err)}
+  }
+  document.getElementById('btnCancel').style.display='none';
 }
 
 async function broadcastCmd(){
@@ -423,6 +506,47 @@ if(window.visualViewport){
 
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
 function fmtUp(ms){const s=Math.floor(ms/1000);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h'}
+
+function showHelp(){
+  const help=`
+<div style="text-align:left;line-height:1.8">
+<h3 style="color:var(--accent);margin:0 0 12px">WinRM Bridge Help</h3>
+
+<b style="color:var(--accent)">Keyboard Shortcuts</b>
+<div style="margin:4px 0 12px;font-size:12px">
+  <b>Enter</b> - Execute command<br>
+  <b>↑ / ↓</b> - Navigate command history<br>
+  <b>Ctrl+C</b> - In terminal, same as STOP
+</div>
+
+<b style="color:var(--accent)">Buttons</b>
+<div style="margin:4px 0 12px;font-size:12px">
+  <b>⚡ Local</b> - Quick connect to localhost<br>
+  <b>⏹ STOP</b> - Cancel running command (Ctrl+C)<br>
+  <b>⚡ ALL</b> - Run command on all sessions<br>
+  <b>+ NEW</b> - Create session (local or remote)
+</div>
+
+<b style="color:var(--accent)">Timeout</b>
+<div style="margin:4px 0 12px;font-size:12px">
+  Commands auto-cancel after 30 seconds.<br>
+  Use STOP button to cancel earlier.
+</div>
+
+<b style="color:var(--accent)">Remote Sessions</b>
+<div style="margin:4px 0 12px;font-size:12px">
+  Click + NEW, enter hostname/IP and<br>
+  credentials to connect via WinRM.
+</div>
+
+<b style="color:var(--accent)">API</b>
+<div style="margin:4px 0;font-size:12px">
+  REST: <code>http://localhost:8775/sessions</code><br>
+  WebSocket: <code>ws://localhost:8775?session=ID</code>
+</div>
+</div>`;
+  document.getElementById('output').innerHTML='<div class="welcome-msg" style="padding:20px">'+help+'</div>';
+}
 
 refreshSessions();setInterval(refreshSessions,10000);
 </script>

@@ -7,10 +7,17 @@ const PORT = 8775;
 const SERVICE_NAME = 'WinRM-Bridge';
 const HIVE_MESH = 'http://localhost:8750';
 
+const http = require('http');
 const path = require('path');
+const WebSocket = require('ws');
+
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Create HTTP server for both Express and WebSocket
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 // Active sessions - fully concurrent
 const sessions = new Map();
@@ -20,6 +27,146 @@ const runningCommands = new Map();
 
 // Default timeout (30 seconds)
 const DEFAULT_TIMEOUT = 30000;
+
+// WebSocket connection handling
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const sessionId = url.searchParams.get('session');
+
+  if (!sessionId || !sessions.has(sessionId)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid session ID' }));
+    ws.close();
+    return;
+  }
+
+  const session = sessions.get(sessionId);
+  session.clients.add(ws);
+  console.log(`⚡ WebSocket client connected to session ${session.label}`);
+
+  // Send buffer (recent output)
+  if (session.buffer.length > 0) {
+    ws.send(JSON.stringify({ type: 'output', data: session.buffer }));
+  }
+
+  ws.on('message', async (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === 'exec') {
+        // Execute command with streaming
+        const command = data.command;
+        const timeout = data.timeout || DEFAULT_TIMEOUT;
+
+        ws.send(JSON.stringify({ type: 'status', status: 'executing', command }));
+
+        try {
+          const result = await executeWithStreaming(sessionId, command, timeout);
+          ws.send(JSON.stringify({ type: 'result', ...result }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'error', message: err.message }));
+        }
+      } else if (data.type === 'interrupt') {
+        // Cancel running command
+        cancelRunningCommand(sessionId);
+        ws.send(JSON.stringify({ type: 'interrupted' }));
+      }
+    } catch (e) {
+      console.error('WebSocket message error:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    session.clients.delete(ws);
+    console.log(`WebSocket client disconnected from session ${session.label}`);
+  });
+});
+
+// Execute command with streaming output to WebSocket clients
+async function executeWithStreaming(sessionId, command, timeout) {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Session not found');
+
+  if (runningCommands.has(sessionId)) {
+    throw new Error('Command already running');
+  }
+
+  const commandId = uuidv4();
+  let cancelled = false;
+  let timeoutId = null;
+
+  runningCommands.set(sessionId, {
+    commandId,
+    command,
+    startTime: Date.now(),
+    cancel: () => { cancelled = true; }
+  });
+
+  const broadcast = (data) => {
+    const msg = JSON.stringify(data);
+    session.clients.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(msg);
+      }
+    });
+  };
+
+  try {
+    console.log(`⚡ [WS] Executing in ${session.label}: ${command}`);
+    const startTime = Date.now();
+
+    // Broadcast that we're starting
+    broadcast({ type: 'output', data: `❯ ${command}\n` });
+    session.buffer += `❯ ${command}\n`;
+
+    const result = await Promise.race([
+      session.ps.invoke(command),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('Command timed out')), timeout);
+      }),
+      new Promise((_, reject) => {
+        const check = setInterval(() => {
+          if (cancelled) {
+            clearInterval(check);
+            reject(new Error('Command cancelled'));
+          }
+        }, 100);
+        runningCommands.get(sessionId).cancelInterval = check;
+      })
+    ]);
+
+    clearTimeout(timeoutId);
+    const executionTime = Date.now() - startTime;
+    const output = result.raw || '(no output)';
+
+    // Broadcast output
+    broadcast({ type: 'output', data: output + '\n' });
+    session.buffer += output + '\n';
+    if (session.buffer.length > 100000) session.buffer = session.buffer.slice(-50000);
+
+    session.lastUsed = Date.now();
+    session.commandCount++;
+
+    return { success: true, output, executionTime, commandCount: session.commandCount };
+  } catch (error) {
+    clearTimeout(timeoutId);
+    const errMsg = `[Error: ${error.message}]\n`;
+    broadcast({ type: 'output', data: errMsg });
+    session.buffer += errMsg;
+    return { success: false, error: error.message, timedOut: error.message.includes('timed out') };
+  } finally {
+    const cmd = runningCommands.get(sessionId);
+    if (cmd?.cancelInterval) clearInterval(cmd.cancelInterval);
+    runningCommands.delete(sessionId);
+  }
+}
+
+// Cancel running command helper
+function cancelRunningCommand(sessionId) {
+  const running = runningCommands.get(sessionId);
+  if (running) {
+    running.cancel();
+    console.log(`⚠ Cancelled command in session ${sessionId}`);
+  }
+}
 
 // Create new session
 app.post('/session/create', async (req, res) => {
@@ -45,7 +192,9 @@ app.post('/session/create', async (req, res) => {
       label: label || `Session-${sessions.size + 1}`,
       created: Date.now(),
       lastUsed: Date.now(),
-      commandCount: 0
+      commandCount: 0,
+      clients: new Set(),
+      buffer: ''
     });
 
     console.log(`✓ Created session: ${sessions.get(sessionId).label} (${sessionId})`);
@@ -333,7 +482,6 @@ setInterval(() => {
 }, 60000);
 
 // Register with Hive mesh via WebSocket
-const WebSocket = require('ws');
 function registerWithHive() {
   try {
     const ws = new WebSocket(`ws://localhost:8750`);
@@ -362,12 +510,13 @@ function registerWithHive() {
   }
 }
 
-app.listen(PORT, async () => {
+server.listen(PORT, async () => {
   console.log(`╔════════════════════════════════════════╗`);
   console.log(`║  ${SERVICE_NAME} Running               ║`);
   console.log(`╚════════════════════════════════════════╝`);
   console.log(`Port: ${PORT}`);
-  console.log(`Ready for concurrent session management`);
+  console.log(`HTTP + WebSocket ready`);
+  console.log(`WebSocket: ws://localhost:${PORT}?session=<id>`);
   console.log(``);
   await registerWithHive();
 });
