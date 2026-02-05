@@ -167,11 +167,12 @@
 
 <!-- Mobile quick connect bar -->
 <div class="quick-bar" id="quickBar">
-  <span class="qb" onclick="quickConnect('localhost')">⚡ Local</span>
-  <span class="qb" onclick="quickConnect('192.168.1.42')">Harold-PC</span>
-  <span class="qb" onclick="quickConnect('192.168.1.97')">Morpu-PC</span>
-  <span class="qb" onclick="quickConnect('192.168.1.162')">AI-PC</span>
-  <span class="qb" onclick="quickConnect('192.168.1.192')">Rock-PC</span>
+  <span class="qb" onclick="quickLocal('powershell')">⚡ PS</span>
+  <span class="qb" onclick="quickLocal('cmd')">CMD</span>
+  <span class="qb" onclick="quickLocal('bash')">Bash</span>
+  <span class="qb" style="opacity:0.5">|</span>
+  <span class="qb" onclick="quickConnect('192.168.1.42')">Harold</span>
+  <span class="qb" onclick="quickConnect('192.168.1.97')">Morpu</span>
   <span class="qb" onclick="showNewSession()">+ New</span>
 </div>
 
@@ -189,13 +190,16 @@
       <div class="no-sessions">No active sessions.<br>Create one to begin.</div>
     </div>
     <div class="quick-connect">
-      <div class="quick-label">Quick Connect</div>
+      <div class="quick-label">Local Terminals</div>
       <div class="quick-btns">
-        <button class="quick-btn" onclick="quickConnect('localhost')">localhost</button>
+        <button class="quick-btn" onclick="quickLocal('powershell')">PowerShell</button>
+        <button class="quick-btn" onclick="quickLocal('cmd')">CMD</button>
+        <button class="quick-btn" onclick="quickLocal('bash')">Git Bash</button>
+      </div>
+      <div class="quick-label" style="margin-top:10px">Remote (WinRM)</div>
+      <div class="quick-btns">
         <button class="quick-btn" onclick="quickConnect('192.168.1.42')">Harold-PC</button>
         <button class="quick-btn" onclick="quickConnect('192.168.1.97')">Morpu-PC</button>
-        <button class="quick-btn" onclick="quickConnect('192.168.1.162')">AI-PC</button>
-        <button class="quick-btn" onclick="quickConnect('192.168.1.192')">Rock-PC</button>
       </div>
     </div>
   </div>
@@ -303,11 +307,12 @@ function renderSessions(){
     tabs.innerHTML='';
     return;
   }
+  const typeIcon=(s)=>s.type==='local'?'⌨':'🌐';
   el.innerHTML=sessions.map(s=>`
     <div class="session-card ${activeSession===s.sessionId?'active':''}" onclick="selectSession('${s.sessionId}')">
-      <div class="session-label">${esc(s.label)}${s.running?' <span class="session-running">⏳</span>':''}</div>
+      <div class="session-label">${typeIcon(s)} ${esc(s.label)}${s.running?' <span class="session-running">⏳</span>':''}${s.alive===false?' <span style="color:var(--red)">✗</span>':''}</div>
       <div class="session-meta">
-        <span class="computer">${esc(s.computer)}</span>
+        <span class="computer">${s.type==='local'?(s.shell||'shell'):esc(s.computer)}</span>
         <span class="cmds">${s.commandCount} cmds</span>
         <span>${s.running?fmtUp(s.running.elapsed)+' running':fmtUp(s.uptime)}</span>
       </div>
@@ -315,7 +320,7 @@ function renderSessions(){
   tabs.innerHTML=sessions.map(s=>`
     <div class="stab ${activeSession===s.sessionId?'active':''}" onclick="selectSession('${s.sessionId}')">
       <span class="sdot" style="${s.running?'background:var(--accent);box-shadow:0 0 8px var(--accent)':''}"></span>
-      ${esc(s.label)}${s.running?' ⏳':''}
+      ${typeIcon(s)} ${esc(s.label)}${s.running?' ⏳':''}
       <span class="sclose" onclick="event.stopPropagation();closeSessionById('${s.sessionId}')">✕</span>
     </div>`).join('');
 }
@@ -493,9 +498,18 @@ async function createSession(){
   document.getElementById('modalPass').value='';
 }
 
+// Create local terminal
+async function quickLocal(shell){
+  const names={powershell:'PowerShell',cmd:'CMD',bash:'Git Bash'};
+  const d=await api('/session/create',{method:'POST',body:{type:'local',shell,label:names[shell]||shell}});
+  if(d.success){await refreshSessions();selectSession(d.sessionId)}
+  else{alert('Failed: '+d.error)}
+}
+
+// Create remote WinRM session
 async function quickConnect(computer){
-  const names={'localhost':'Local','192.168.1.42':'Harold-PC','192.168.1.97':'Morpu-PC','192.168.1.162':'AI-PC','192.168.1.192':'Rock-PC'};
-  const d=await api('/session/create',{method:'POST',body:{computer,label:names[computer]||computer}});
+  const names={'192.168.1.42':'Harold-PC','192.168.1.97':'Morpu-PC','192.168.1.162':'AI-PC','192.168.1.192':'Rock-PC'};
+  const d=await api('/session/create',{method:'POST',body:{type:'winrm',computer,label:names[computer]||computer}});
   if(d.success){await refreshSessions();selectSession(d.sessionId)}
   else{alert('Failed: '+d.error)}
 }

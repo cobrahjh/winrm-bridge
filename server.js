@@ -2,6 +2,7 @@ const express = require('express');
 const { PowerShell } = require('node-powershell');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
+const { spawn } = require('child_process');
 
 const PORT = 8775;
 const SERVICE_NAME = 'WinRM-Bridge';
@@ -10,6 +11,13 @@ const HIVE_MESH = 'http://localhost:8750';
 const http = require('http');
 const path = require('path');
 const WebSocket = require('ws');
+
+// Shell configurations for local terminals
+const SHELLS = {
+  powershell: { path: 'powershell.exe', args: ['-NoLogo', '-NoExit'], name: 'PowerShell' },
+  cmd: { path: 'cmd.exe', args: ['/K'], name: 'CMD' },
+  bash: { path: 'C:\\Program Files\\Git\\usr\\bin\\bash.exe', args: ['--login', '-i'], name: 'Git Bash' }
+};
 
 const app = express();
 app.use(express.json());
@@ -51,21 +59,42 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (msg) => {
     try {
       const data = JSON.parse(msg);
-      if (data.type === 'exec') {
-        // Execute command with streaming
+
+      if (data.type === 'input') {
+        // Direct input for local terminals
+        if (session.type === 'local' && session.process && !session.process.killed) {
+          session.process.stdin.write(data.data);
+          session.lastUsed = Date.now();
+        } else {
+          ws.send(JSON.stringify({ type: 'error', message: 'No input stream available' }));
+        }
+      } else if (data.type === 'exec') {
+        // Execute command (works for both local and WinRM)
         const command = data.command;
         const timeout = data.timeout || DEFAULT_TIMEOUT;
 
-        ws.send(JSON.stringify({ type: 'status', status: 'executing', command }));
-
-        try {
-          const result = await executeWithStreaming(sessionId, command, timeout);
-          ws.send(JSON.stringify({ type: 'result', ...result }));
-        } catch (err) {
-          ws.send(JSON.stringify({ type: 'error', message: err.message }));
+        if (session.type === 'local') {
+          // For local terminals, just send as input
+          if (session.process && !session.process.killed) {
+            session.process.stdin.write(command + '\r\n');
+            session.lastUsed = Date.now();
+            session.commandCount++;
+          }
+        } else {
+          // For WinRM, use executeWithStreaming
+          ws.send(JSON.stringify({ type: 'status', status: 'executing', command }));
+          try {
+            const result = await executeWithStreaming(sessionId, command, timeout);
+            ws.send(JSON.stringify({ type: 'result', ...result }));
+          } catch (err) {
+            ws.send(JSON.stringify({ type: 'error', message: err.message }));
+          }
         }
       } else if (data.type === 'interrupt') {
-        // Cancel running command
+        // Send Ctrl+C for local, cancel for WinRM
+        if (session.type === 'local' && session.process && !session.process.killed) {
+          session.process.stdin.write('\x03');
+        }
         cancelRunningCommand(sessionId);
         ws.send(JSON.stringify({ type: 'interrupted' }));
       }
@@ -168,42 +197,111 @@ function cancelRunningCommand(sessionId) {
   }
 }
 
-// Create new session
+// Create new session (local terminal or remote WinRM)
 app.post('/session/create', async (req, res) => {
-  const { computer = 'localhost', credentials, label } = req.body;
+  const { type = 'local', shell = 'powershell', computer = 'localhost', credentials, label, cwd } = req.body;
   const sessionId = uuidv4();
 
   try {
-    const ps = new PowerShell({
-      executionPolicy: 'Bypass',
-      noProfile: true
-    });
+    let session;
 
-    // Initialize remote session if needed
-    if (computer !== 'localhost' && credentials) {
-      const credCmd = `$cred = New-Object System.Management.Automation.PSCredential('${credentials.username}', (ConvertTo-SecureString '${credentials.password}' -AsPlainText -Force))`;
-      await ps.invoke(credCmd);
-      await ps.invoke(`$session = New-PSSession -ComputerName ${computer} -Credential $cred`);
+    if (type === 'local') {
+      // Spawn local terminal process
+      const shellConfig = SHELLS[shell] || SHELLS.powershell;
+      const workDir = cwd || process.env.USERPROFILE || 'C:\\';
+
+      const proc = spawn(shellConfig.path, shellConfig.args, {
+        cwd: workDir,
+        env: { ...process.env, TERM: 'xterm-256color' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false
+      });
+
+      session = {
+        type: 'local',
+        process: proc,
+        shell,
+        computer: 'localhost',
+        label: label || `${shellConfig.name} ${sessions.size + 1}`,
+        created: Date.now(),
+        lastUsed: Date.now(),
+        commandCount: 0,
+        clients: new Set(),
+        buffer: ''
+      };
+
+      // Stream stdout/stderr to WebSocket clients
+      const broadcast = (data) => {
+        const text = data.toString();
+        session.buffer += text;
+        if (session.buffer.length > 100000) session.buffer = session.buffer.slice(-50000);
+        const msg = JSON.stringify({ type: 'output', data: text });
+        session.clients.forEach(ws => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+        });
+      };
+
+      proc.stdout.on('data', broadcast);
+      proc.stderr.on('data', broadcast);
+      proc.on('exit', (code) => {
+        const msg = `\r\n[Process exited with code ${code}]\r\n`;
+        session.buffer += msg;
+        session.clients.forEach(ws => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'output', data: msg }));
+            ws.send(JSON.stringify({ type: 'exit', code }));
+          }
+        });
+      });
+      proc.on('error', (err) => {
+        console.error(`Terminal error: ${err.message}`);
+      });
+
+      // Initial prompt
+      setTimeout(() => {
+        if (!proc.killed) {
+          if (shell === 'powershell') proc.stdin.write('Write-Output "[Terminal Ready] $(Get-Location)"\r\n');
+          else if (shell === 'cmd') proc.stdin.write('echo [Terminal Ready] & cd\r\n');
+          else proc.stdin.write('echo "[Terminal Ready] $(pwd)"\n');
+        }
+      }, 300);
+
+    } else {
+      // WinRM session via node-powershell
+      const ps = new PowerShell({
+        executionPolicy: 'Bypass',
+        noProfile: true
+      });
+
+      if (computer !== 'localhost' && credentials) {
+        const credCmd = `$cred = New-Object System.Management.Automation.PSCredential('${credentials.username}', (ConvertTo-SecureString '${credentials.password}' -AsPlainText -Force))`;
+        await ps.invoke(credCmd);
+        await ps.invoke(`$session = New-PSSession -ComputerName ${computer} -Credential $cred`);
+      }
+
+      session = {
+        type: 'winrm',
+        ps,
+        computer,
+        label: label || `WinRM-${computer}`,
+        created: Date.now(),
+        lastUsed: Date.now(),
+        commandCount: 0,
+        clients: new Set(),
+        buffer: ''
+      };
     }
 
-    sessions.set(sessionId, {
-      ps,
-      computer,
-      label: label || `Session-${sessions.size + 1}`,
-      created: Date.now(),
-      lastUsed: Date.now(),
-      commandCount: 0,
-      clients: new Set(),
-      buffer: ''
-    });
+    sessions.set(sessionId, session);
+    console.log(`✓ Created ${session.type} session: ${session.label} (${sessionId})`);
 
-    console.log(`✓ Created session: ${sessions.get(sessionId).label} (${sessionId})`);
-
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       sessionId,
-      computer,
-      label: sessions.get(sessionId).label,
+      type: session.type,
+      computer: session.computer,
+      shell: session.shell,
+      label: session.label,
       message: 'Session created'
     });
   } catch (error) {
@@ -409,7 +507,11 @@ app.delete('/session/:sessionId', async (req, res) => {
   }
 
   try {
-    await session.ps.dispose();
+    if (session.type === 'local' && session.process) {
+      session.process.kill();
+    } else if (session.ps) {
+      await session.ps.dispose();
+    }
     sessions.delete(sessionId);
     console.log(`✓ Closed session: ${session.label}`);
     res.json({ success: true, message: 'Session closed', sessionId });
@@ -423,7 +525,11 @@ app.delete('/sessions/all', async (req, res) => {
   const closed = [];
   for (const [id, session] of sessions.entries()) {
     try {
-      await session.ps.dispose();
+      if (session.type === 'local' && session.process) {
+        session.process.kill();
+      } else if (session.ps) {
+        await session.ps.dispose();
+      }
       sessions.delete(id);
       closed.push(id);
     } catch (error) {
@@ -440,13 +546,16 @@ app.get('/sessions', (req, res) => {
     const running = runningCommands.get(id);
     return {
       sessionId: id,
+      type: session.type || 'winrm',
+      shell: session.shell,
       label: session.label,
       computer: session.computer,
       created: session.created,
       lastUsed: session.lastUsed,
       uptime: Date.now() - session.created,
       commandCount: session.commandCount,
-      running: running ? { command: running.command, elapsed: Date.now() - running.startTime } : null
+      running: running ? { command: running.command, elapsed: Date.now() - running.startTime } : null,
+      alive: session.type === 'local' ? (session.process && !session.process.killed) : true
     };
   });
 
