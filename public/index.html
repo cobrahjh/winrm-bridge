@@ -241,6 +241,14 @@
       <input class="terminal-input" id="cmdInput" placeholder="PowerShell command..." disabled
              onkeydown="if(event.key==='Enter'){event.preventDefault();execCmd()}"
              enterkeyhint="send" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+      <select id="timeoutSelect" title="Command timeout" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim);padding:8px;font-family:var(--mono);font-size:11px;border-radius:4px;cursor:pointer">
+        <option value="10000">10s</option>
+        <option value="30000" selected>30s</option>
+        <option value="60000">1m</option>
+        <option value="120000">2m</option>
+        <option value="300000">5m</option>
+        <option value="0">∞</option>
+      </select>
       <button class="btn-send" id="btnSend" onclick="execCmd()" disabled>▶</button>
     </div>
   </div>
@@ -390,6 +398,10 @@ async function execCmd(){
   if(!cmd||!activeSession)return;
   input.value='';cmdHistory.unshift(cmd);cmdHistoryIdx=-1;
 
+  // Get timeout from selector (0 = no timeout)
+  const timeoutVal = parseInt(document.getElementById('timeoutSelect').value) || 600000;
+  const timeout = timeoutVal === 0 ? 600000 : timeoutVal; // 0 means 10 min max
+
   // Show cancel button, disable input
   document.getElementById('btnCancel').style.display='';
   document.getElementById('cmdInput').disabled=true;
@@ -397,7 +409,7 @@ async function execCmd(){
 
   // Use WebSocket if connected, otherwise fall back to REST
   if(ws && ws.readyState===WebSocket.OPEN){
-    ws.send(JSON.stringify({type:'exec',command:cmd,timeout:30000}));
+    ws.send(JSON.stringify({type:'exec',command:cmd,timeout}));
   }else{
     // Fallback to REST API
     if(!hist[activeSession])hist[activeSession]=[];
@@ -405,7 +417,7 @@ async function execCmd(){
     hist[activeSession].push({cmd,output:'⏳ executing...',time:'',error:false});
     renderOutput();
     try{
-      const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd}});
+      const d=await api(`/session/${activeSession}/exec`,{method:'POST',body:{command:cmd,timeout}});
       hist[activeSession][idx]={cmd,output:d.success?(d.output||'(no output)'):d.error,time:d.executionTime||'?',error:!d.success};
       if(d.timedOut)hist[activeSession][idx].output='⏱ '+hist[activeSession][idx].output;
       if(d.cancelled)hist[activeSession][idx].output='⏹ '+hist[activeSession][idx].output;
