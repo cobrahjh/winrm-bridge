@@ -2,7 +2,7 @@ const express = require('express');
 const { PowerShell } = require('node-powershell');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
-const { spawn } = require('child_process');
+const pty = require('node-pty');
 
 const PORT = 8775;
 const SERVICE_NAME = 'WinRM-Bridge';
@@ -62,8 +62,8 @@ wss.on('connection', (ws, req) => {
 
       if (data.type === 'input') {
         // Direct input for local terminals
-        if (session.type === 'local' && session.process && !session.process.killed) {
-          session.process.stdin.write(data.data);
+        if (session.type === 'local' && session.pty) {
+          session.pty.write(data.data);
           session.lastUsed = Date.now();
         } else {
           ws.send(JSON.stringify({ type: 'error', message: 'No input stream available' }));
@@ -74,9 +74,9 @@ wss.on('connection', (ws, req) => {
         const timeout = data.timeout || DEFAULT_TIMEOUT;
 
         if (session.type === 'local') {
-          // For local terminals, just send as input
-          if (session.process && !session.process.killed) {
-            session.process.stdin.write(command + '\r\n');
+          // For local terminals, just send as input via PTY
+          if (session.pty) {
+            session.pty.write(command + '\r\n');
             session.lastUsed = Date.now();
             session.commandCount++;
           }
@@ -92,11 +92,16 @@ wss.on('connection', (ws, req) => {
         }
       } else if (data.type === 'interrupt') {
         // Send Ctrl+C for local, cancel for WinRM
-        if (session.type === 'local' && session.process && !session.process.killed) {
-          session.process.stdin.write('\x03');
+        if (session.type === 'local' && session.pty) {
+          session.pty.write('\x03');
         }
         cancelRunningCommand(sessionId);
         ws.send(JSON.stringify({ type: 'interrupted' }));
+      } else if (data.type === 'resize' && data.cols && data.rows) {
+        // Resize PTY
+        if (session.type === 'local' && session.pty) {
+          session.pty.resize(data.cols, data.rows);
+        }
       }
     } catch (e) {
       console.error('WebSocket message error:', e);
@@ -206,20 +211,21 @@ app.post('/session/create', async (req, res) => {
     let session;
 
     if (type === 'local') {
-      // Spawn local terminal process
+      // Spawn local terminal with PTY (real terminal emulation)
       const shellConfig = SHELLS[shell] || SHELLS.powershell;
       const workDir = cwd || process.env.USERPROFILE || 'C:\\';
 
-      const proc = spawn(shellConfig.path, shellConfig.args, {
+      const proc = pty.spawn(shellConfig.path, shellConfig.args, {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 30,
         cwd: workDir,
-        env: { ...process.env, TERM: 'xterm-256color' },
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: false
+        env: process.env
       });
 
       session = {
         type: 'local',
-        process: proc,
+        pty: proc,
         shell,
         computer: 'localhost',
         label: label || `${shellConfig.name} ${sessions.size + 1}`,
@@ -230,41 +236,26 @@ app.post('/session/create', async (req, res) => {
         buffer: ''
       };
 
-      // Stream stdout/stderr to WebSocket clients
-      const broadcast = (data) => {
-        const text = data.toString();
-        session.buffer += text;
+      // Stream PTY output to WebSocket clients
+      proc.onData((data) => {
+        session.buffer += data;
         if (session.buffer.length > 100000) session.buffer = session.buffer.slice(-50000);
-        const msg = JSON.stringify({ type: 'output', data: text });
+        const msg = JSON.stringify({ type: 'output', data });
         session.clients.forEach(ws => {
           if (ws.readyState === WebSocket.OPEN) ws.send(msg);
         });
-      };
+      });
 
-      proc.stdout.on('data', broadcast);
-      proc.stderr.on('data', broadcast);
-      proc.on('exit', (code) => {
-        const msg = `\r\n[Process exited with code ${code}]\r\n`;
+      proc.onExit(({ exitCode }) => {
+        const msg = `\r\n[Process exited with code ${exitCode}]\r\n`;
         session.buffer += msg;
         session.clients.forEach(ws => {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'output', data: msg }));
-            ws.send(JSON.stringify({ type: 'exit', code }));
+            ws.send(JSON.stringify({ type: 'exit', code: exitCode }));
           }
         });
       });
-      proc.on('error', (err) => {
-        console.error(`Terminal error: ${err.message}`);
-      });
-
-      // Initial prompt
-      setTimeout(() => {
-        if (!proc.killed) {
-          if (shell === 'powershell') proc.stdin.write('Write-Output "[Terminal Ready] $(Get-Location)"\r\n');
-          else if (shell === 'cmd') proc.stdin.write('echo [Terminal Ready] & cd\r\n');
-          else proc.stdin.write('echo "[Terminal Ready] $(pwd)"\n');
-        }
-      }, 300);
 
     } else {
       // WinRM session via node-powershell
@@ -507,8 +498,8 @@ app.delete('/session/:sessionId', async (req, res) => {
   }
 
   try {
-    if (session.type === 'local' && session.process) {
-      session.process.kill();
+    if (session.type === 'local' && session.pty) {
+      session.pty.kill();
     } else if (session.ps) {
       await session.ps.dispose();
     }
@@ -525,8 +516,8 @@ app.delete('/sessions/all', async (req, res) => {
   const closed = [];
   for (const [id, session] of sessions.entries()) {
     try {
-      if (session.type === 'local' && session.process) {
-        session.process.kill();
+      if (session.type === 'local' && session.pty) {
+        session.pty.kill();
       } else if (session.ps) {
         await session.ps.dispose();
       }
@@ -555,7 +546,7 @@ app.get('/sessions', (req, res) => {
       uptime: Date.now() - session.created,
       commandCount: session.commandCount,
       running: running ? { command: running.command, elapsed: Date.now() - running.startTime } : null,
-      alive: session.type === 'local' ? (session.process && !session.process.killed) : true
+      alive: session.type === 'local' ? !!session.pty : true
     };
   });
 
